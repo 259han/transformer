@@ -10,6 +10,7 @@ import numpy as np
 import os
 import pickle
 import traceback
+import datetime
 
 # 添加缓存目录
 CACHE_DIR = f"{DATA_DIR}/cache"
@@ -94,9 +95,13 @@ def get_data_loader(file_name, shuffle=True):
             data_limit = TRAIN_CONFIG.get('data_limit', {}).get('train', None)
         elif file_name == VALID_NAME:
             data_limit = TRAIN_CONFIG.get('data_limit', {}).get('valid', None)
+            
+        # 添加数据处理版本号，当预处理逻辑改变时，能够重新生成缓存
+        proc_version = "v2"  # 每次修改预处理逻辑时应递增
+        
         # 根据是否有数据限制生成不同的缓存文件名
         limit_suffix = f"_limit{data_limit}" if data_limit is not None else ""
-        cache_file = f"{CACHE_DIR}/{file_name}{limit_suffix}.pkl"
+        cache_file = f"{CACHE_DIR}/{file_name}{limit_suffix}_proc{proc_version}.pkl"
         logger.debug(f"数据限制: {data_limit if data_limit else '无限制'}, 缓存文件: {cache_file}")
         
         # 使用mmap进行快速缓存加载
@@ -119,6 +124,22 @@ def get_data_loader(file_name, shuffle=True):
             try:
                 # 尝试使用更快的加载方式
                 cached_data = load_cache_with_mmap(cache_file)
+                
+                # 检查缓存数据的完整性
+                required_keys = ['src_list', 'input_trg_list', 'output_trg_list', 'metadata']
+                if not all(key in cached_data for key in required_keys):
+                    logger.warning("缓存数据格式不完整，将重新生成")
+                    raise ValueError("缓存数据不完整")
+                
+                # 获取缓存的元数据
+                metadata = cached_data.get('metadata', {})
+                cache_seq_len = metadata.get('seq_len')
+                
+                # 检查关键参数是否变化
+                if cache_seq_len != seq_len:
+                    logger.warning(f"序列长度已变更: 缓存={cache_seq_len}, 当前={seq_len}，将重新生成缓存")
+                    raise ValueError("序列长度不匹配")
+                
                 src_list = cached_data['src_list']
                 input_trg_list = cached_data['input_trg_list']
                 output_trg_list = cached_data['output_trg_list']
@@ -127,7 +148,11 @@ def get_data_loader(file_name, shuffle=True):
             except Exception as e:
                 logger.error(f"加载缓存文件失败: {str(e)}")
                 logger.info(f"将重新处理数据并创建新的缓存...")
-                os.remove(cache_file)  # 删除可能损坏的缓存文件
+                try:
+                    os.remove(cache_file)  # 删除可能损坏的缓存文件
+                    logger.debug(f"已删除无效的缓存文件: {cache_file}")
+                except Exception as e2:
+                    logger.warning(f"删除缓存文件失败: {str(e2)}，将尝试覆盖它")
                 # 继续执行下面的代码，重新处理数据
         else:
             logger.info(f"未找到缓存，开始处理 {file_name}...")
@@ -187,6 +212,17 @@ def get_data_loader(file_name, shuffle=True):
             input_trg_list, output_trg_list = process_trg(trg_text_list) # (sample_num, L)
             logger.info(f"目标语言数据处理完成，输入形状: {np.shape(input_trg_list)}, 输出形状: {np.shape(output_trg_list)}")
             
+            # 创建元数据用于缓存校验
+            metadata = {
+                'created_at': datetime.datetime.now().isoformat(),
+                'seq_len': seq_len,
+                'proc_version': proc_version,
+                'data_limit': data_limit,
+                'pad_id': pad_id,
+                'eos_id': eos_id,
+                'sos_id': sos_id,
+            }
+            
             # 保存缓存
             try:
                 logger.info(f"保存数据到缓存: {cache_file}")
@@ -195,7 +231,8 @@ def get_data_loader(file_name, shuffle=True):
                     pickle.dump({
                         'src_list': src_list,
                         'input_trg_list': input_trg_list,
-                        'output_trg_list': output_trg_list
+                        'output_trg_list': output_trg_list,
+                        'metadata': metadata  # 添加元数据
                     }, f)
                 logger.info("缓存保存完成!")
             except Exception as e:
@@ -251,9 +288,42 @@ def pad_or_truncate(tokenized_text):
         padding = [pad_id] * left
         tokenized_text += padding
     else:
-        tokenized_text = tokenized_text[:seq_len]
+        # 对长句保留开头和结尾部分，提高语义完整性
+        if original_len > seq_len + 10:  # 只对明显超长的句子应用智能截断
+            # 保留前2/3和后1/3的内容
+            keep_front = int(seq_len * 0.7)
+            keep_end = seq_len - keep_front
+            tokenized_text = tokenized_text[:keep_front] + tokenized_text[-keep_end:]
+        else:
+            # 对稍微超长的简单截断
+            tokenized_text = tokenized_text[:seq_len]
     
     return tokenized_text
+
+
+def clean_text(text, default_text="."):
+    """
+    清洗文本，处理常见问题
+    
+    参数:
+    - text: 待清洗的文本
+    - default_text: 文本为空时的默认值
+    
+    返回:
+    - 清洗后的文本
+    """
+    # 基本清洗
+    text = text.strip()
+    # 规范化空白字符
+    text = ' '.join(text.split())
+    # 移除控制字符和不可打印字符
+    text = ''.join(c for c in text if c.isprintable())
+    
+    # 对空文本的处理
+    if not text:
+        return default_text
+        
+    return text
 
 
 def process_src(text_list):
@@ -277,42 +347,34 @@ def process_src(text_list):
         
         for i, text in enumerate(tqdm(text_list, desc="处理源语言")):
             try:
-                # 数据清洗
-                text = text.strip()
-                # 移除多余的空格
-                text = ' '.join(text.split())
-                # 移除特殊字符
-                text = ''.join(c for c in text if c.isprintable())
+                # 使用改进的清洗函数
+                text = clean_text(text)
                 
-                # 检查是否为空文本
-                if not text:
-                    text = "."  # 使用点号作为默认的非空文本
-                    logger.warning(f"发现空文本，已替换为默认文本，行号: {i+1}")
-                
-                # SentencePiece EncodeAsIds handles encoding internally based on the model
+                # SentencePiece分词
                 tokenized = src_sp.EncodeAsIds(text)
                 
                 # 记录长句子
                 if len(tokenized) > seq_len:
-                    logger.debug(f"发现长句子 ({len(tokenized)} > {seq_len})，将被截断，行号: {i+1}")
+                    logger.debug(f"发现长句子 ({len(tokenized)} > {seq_len})，将进行智能截断，行号: {i+1}")
                 
                 tokenized_list.append(pad_or_truncate(tokenized))
                 
                 # 定期报告进度
-                if (i+1) % 10000 == 0 or i+1 == total:
-                    logger.debug(f"源语言处理进度: {i+1}/{total} 行 ({(i+1)/total*100:.1f}%)")
-                    
+                if (i+1) % 50000 == 0 or i+1 == total:
+                    logger.info(f"源语言处理进度: {i+1}/{total} 行 ({(i+1)/total*100:.1f}%)")
             except Exception as e:
-                logger.warning(f"处理源语言文本时出错，行号: {i+1}, 错误: {str(e)}")
-                # 使用空序列替代，确保索引一致性
-                tokenized_list.append(pad_or_truncate([unk_id]))
-                
-        return tokenized_list
+                logger.error(f"处理源语言文本时出错，行号 {i+1}: {str(e)}")
+                # 使用空序列替代，但添加unk_id避免纯填充
+                empty_seq = [unk_id] + [pad_id] * (seq_len - 1)
+                tokenized_list.append(empty_seq)
         
+        return tokenized_list
+    
     except Exception as e:
-        logger.error(f"处理源语言数据集时出错: {str(e)}")
+        logger.error(f"源语言处理过程出错: {str(e)}")
         logger.error(traceback.format_exc())
-        raise
+        return []
+
 
 def process_trg(text_list):
     """
@@ -336,24 +398,15 @@ def process_trg(text_list):
         
         for i, text in enumerate(tqdm(text_list, desc="处理目标语言")):
             try:
-                # 数据清洗
-                text = text.strip()
-                # 移除多余的空格
-                text = ' '.join(text.split())
-                # 移除特殊字符
-                text = ''.join(c for c in text if c.isprintable())
+                # 使用改进的清洗函数
+                text = clean_text(text)
                 
-                # 检查是否为空文本
-                if not text:
-                    text = "."  # 使用点号作为默认的非空文本
-                    logger.warning(f"发现空文本，已替换为默认文本，行号: {i+1}")
-                
-                # SentencePiece EncodeAsIds handles encoding internally based on the model
+                # SentencePiece分词
                 tokenized = trg_sp.EncodeAsIds(text)
                 
                 # 记录长句子
                 if len(tokenized) >= seq_len - 1:  # 减1是因为还要加上sos或eos
-                    logger.debug(f"发现长句子 ({len(tokenized)} > {seq_len-1})，将被截断，行号: {i+1}")
+                    logger.debug(f"发现长句子 ({len(tokenized)} > {seq_len-1})，将进行智能截断，行号: {i+1}")
                 
                 # 添加开始和结束标记
                 trg_input = [sos_id] + tokenized
@@ -363,23 +416,22 @@ def process_trg(text_list):
                 output_tokenized_list.append(pad_or_truncate(trg_output))
                 
                 # 定期报告进度
-                if (i+1) % 10000 == 0 or i+1 == total:
-                    logger.debug(f"目标语言处理进度: {i+1}/{total} 行 ({(i+1)/total*100:.1f}%)")
-                    
+                if (i+1) % 50000 == 0 or i+1 == total:
+                    logger.info(f"目标语言处理进度: {i+1}/{total} 行 ({(i+1)/total*100:.1f}%)")
             except Exception as e:
-                logger.warning(f"处理目标语言文本时出错，行号: {i+1}, 错误: {str(e)}")
-                # 使用空序列替代，确保索引一致性
-                empty_input = [sos_id, unk_id]
-                empty_output = [unk_id, eos_id]
-                input_tokenized_list.append(pad_or_truncate(empty_input))
-                output_tokenized_list.append(pad_or_truncate(empty_output))
-
-        return input_tokenized_list, output_tokenized_list
+                logger.error(f"处理目标语言文本时出错，行号 {i+1}: {str(e)}")
+                # 使用具有基本结构的空序列替代
+                empty_input = [sos_id] + [pad_id] * (seq_len - 1)
+                empty_output = [unk_id] + [eos_id] + [pad_id] * (seq_len - 2)
+                input_tokenized_list.append(empty_input)
+                output_tokenized_list.append(empty_output)
         
+        return input_tokenized_list, output_tokenized_list
+    
     except Exception as e:
-        logger.error(f"处理目标语言数据集时出错: {str(e)}")
+        logger.error(f"目标语言处理过程出错: {str(e)}")
         logger.error(traceback.format_exc())
-        raise
+        return [], []
 
 
 class CustomDataset(Dataset):
@@ -403,12 +455,37 @@ class CustomDataset(Dataset):
                 logger.error(error_msg)
                 raise ValueError(error_msg)
             
-            # 验证每个句子的长度
-            for i in range(min(5, len(src_list))):  # 只检查前5个，避免太慢
+            # 验证数据样本
+            self.valid_indices = []
+            invalid_count = 0
+            max_check = min(1000, len(src_list))  # 检查更多样本但不超过1000个
+            
+            for i in range(max_check):
+                is_valid = True
+                
+                # 检查序列长度
                 if len(src_list[i]) != seq_len or len(input_trg_list[i]) != seq_len or len(output_trg_list[i]) != seq_len:
-                    error_msg = f"序列长度不匹配，索引 {i}: 源={len(src_list[i])}, 输入目标={len(input_trg_list[i])}, 输出目标={len(output_trg_list[i])}, 期望={seq_len}"
-                    logger.error(error_msg)
-                    raise ValueError(error_msg)
+                    logger.warning(f"序列长度不匹配，索引 {i}: 源={len(src_list[i])}, 输入目标={len(input_trg_list[i])}, 输出目标={len(output_trg_list[i])}, 期望={seq_len}")
+                    is_valid = False
+                
+                # 检查特殊标记
+                # 检查目标语言输入是否以SOS开始
+                if input_trg_list[i][0] != sos_id:
+                    logger.warning(f"目标语言输入未以SOS开始，索引 {i}")
+                    is_valid = False
+                
+                # 跳过无效样本
+                if is_valid:
+                    self.valid_indices.append(i)
+                else:
+                    invalid_count += 1
+            
+            # 假设剩余未检查的数据都是有效的
+            if max_check < len(src_list):
+                self.valid_indices.extend(range(max_check, len(src_list)))
+            
+            if invalid_count > 0:
+                logger.warning(f"发现 {invalid_count}/{max_check} 个无效样本，将在训练中跳过")
             
             # 转换为张量
             logger.debug("转换数据为PyTorch张量...")
@@ -416,11 +493,21 @@ class CustomDataset(Dataset):
             self.input_trg_data = torch.LongTensor(input_trg_list)
             self.output_trg_data = torch.LongTensor(output_trg_list)
             
-            logger.info(f"数据集创建完成，共 {len(src_list)} 条数据")
+            # 统计其他指标
+            has_pad = torch.sum(self.src_data == pad_id).item() > 0
+            has_eos = torch.sum(self.output_trg_data == eos_id).item() > 0
+            
+            logger.info(f"数据集创建完成，共 {len(src_list)} 条数据，有效样本 {len(self.valid_indices)} 条")
+            logger.debug(f"数据集统计: 包含填充={has_pad}, 包含EOS标记={has_eos}")
         
         except Exception as e:
             logger.error(f"创建数据集时出错: {str(e)}")
             logger.error(traceback.format_exc())
+            # 确保至少有一些数据可用，即使出错
+            self.src_data = torch.LongTensor(src_list) if isinstance(src_list, list) else src_list
+            self.input_trg_data = torch.LongTensor(input_trg_list) if isinstance(input_trg_list, list) else input_trg_list
+            self.output_trg_data = torch.LongTensor(output_trg_list) if isinstance(output_trg_list, list) else output_trg_list
+            self.valid_indices = list(range(len(self.src_data)))
             raise
 
     def make_mask(self):
@@ -460,9 +547,23 @@ class CustomDataset(Dataset):
         - (src, input_trg, output_trg) 数据元组
         """
         try:
-            return self.src_data[idx], self.input_trg_data[idx], self.output_trg_data[idx]
+            # 使用有效索引访问数据
+            real_idx = self.valid_indices[idx] if idx < len(self.valid_indices) else idx
+            
+            # 尝试获取样本，添加基本错误检查
+            src = self.src_data[real_idx]
+            input_trg = self.input_trg_data[real_idx]
+            output_trg = self.output_trg_data[real_idx]
+            
+            # 简单验证样本格式是否正确
+            if input_trg[0] != sos_id:
+                logger.warning(f"获取到的样本不以SOS开始，索引 {real_idx}，将修复")
+                input_trg[0] = sos_id
+                
+            return src, input_trg, output_trg
+            
         except Exception as e:
-            logger.error(f"获取数据样本时出错，索引: {idx}, 错误: {str(e)}")
+            logger.error(f"获取数据样本时出错，索引: {idx}，映射索引: {real_idx if 'real_idx' in locals() else '未知'}, 错误: {str(e)}")
             # 返回一个空样本，避免训练中断
             device = self.src_data.device
             empty_src = torch.full((seq_len,), pad_id, dtype=torch.long, device=device)
@@ -482,7 +583,8 @@ class CustomDataset(Dataset):
         返回:
         - 样本数量
         """
-        return len(self.src_data)
+        # 使用有效样本的数量
+        return len(self.valid_indices)
 
 def clear_cache(file_name=None):
     """

@@ -118,18 +118,8 @@ def validate_sp_models():
         # 测试分词功能
         test_sentence = "This is a test sentence."
         src_tokens = src_sp.EncodeAsIds(test_sentence)
-        src_pieces = src_sp.EncodeAsPieces(test_sentence)
         
         logger.info(f"SentencePiece模型加载成功，词汇表大小: 源={src_sp.GetPieceSize()}, 目标={trg_sp.GetPieceSize()}")
-        logger.debug(f"测试分词结果: {test_sentence} -> {src_pieces}")
-        
-        # 验证特殊标记
-        pad_token = src_sp.IdToPiece(pad_id)
-        sos_token = src_sp.IdToPiece(sos_id)
-        eos_token = src_sp.IdToPiece(eos_id)
-        unk_token = src_sp.IdToPiece(unk_id)
-        
-        logger.debug(f"特殊标记: PAD={pad_token}, SOS={sos_token}, EOS={eos_token}, UNK={unk_token}")
         
         return True
     except Exception as e:

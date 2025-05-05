@@ -71,7 +71,7 @@ MODEL_CONFIG = {
 
 # 日志配置
 LOG_CONFIG = {
-    'level': 'info',           # 日志级别: debug, info, warning, error, critical
+    'level': 'warning',           # 日志级别: debug, info, warning, error, critical
     'console': True,           # 是否输出到控制台
     'log_file': True,          # 是否输出到文件
     'max_files': 10,            # 保留最大日志文件数
@@ -80,9 +80,7 @@ LOG_CONFIG = {
 
 # 运行/推理/数据相关配置
 TRAIN_CONFIG = {
-    'mode': 'train',           # 运行模式: train 或 inference
     'ckpt_name': 'best_ckpt.tar',  # 检查点文件名
-    'input_text': 'The European Parliament has passed an important resolution', # 推理输入文本
     'decode_method': 'beam',       # 解码方法: 'greedy' 或 'beam'
     'auto_resume': True,           # 是否自动查找最新检查点并继续训练
     'resume_epoch': None,          # 从哪个epoch继续训练

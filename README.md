@@ -17,6 +17,8 @@ A neural machine translation model based on the Transformer architecture, specif
 - Support for both Beam Search and Greedy Search decoding strategies
 - Training with learning rate scheduling and early stopping
 - Evaluation using BLEU score
+- Interactive translation mode for easy usage
+- Batch file translation for processing large documents
 
 ### Project Structure
 
@@ -71,14 +73,37 @@ Additional training options:
 
 #### Translation with the Model
 
+The model supports three inference modes: single sentence translation, interactive translation, and batch file translation.
+
+**Currently supported language pair:** English → French
+
+**1. Single Sentence Translation**
 ```bash
 python main.py --mode inference --input "This is a test sentence." --decode beam
 ```
 
-Options:
+**2. Interactive Translation Mode**
+```bash
+python main.py --mode inference
+```
+
+In interactive mode, you can:
+- Enter any English text to translate it to French
+- Type `switch` to toggle between beam and greedy decoding methods
+- Type `q`, `exit` or `quit` to exit the program
+- Type `help` or `?` to view help information
+
+**3. Batch File Translation**
+```bash
+python main.py --mode inference --file input.txt --output translated.txt --decode beam
+```
+
+Translation options:
 - `--decode beam`: Use beam search decoding (default)
 - `--decode greedy`: Use greedy search decoding
 - `--ckpt_name NAME`: Use a specific checkpoint (defaults to best_ckpt.tar)
+- `--file PATH`: Specify input file path for batch translation
+- `--output PATH`: Specify output file path for batch translation (optional)
 
 ### System Requirements
 
@@ -117,6 +142,8 @@ To adjust model hyperparameters or optimization options, edit the `MODEL_CONFIG`
 - 支持束搜索(Beam Search)和贪婪搜索(Greedy Search)解码策略
 - 训练过程包含学习率调度和早停机制
 - 使用BLEU分数进行评估
+- 交互式翻译模式，便于日常使用
+- 批量文件翻译功能，适用于处理大型文档
 
 ### 项目结构
 
@@ -171,14 +198,37 @@ python main.py --mode train
 
 #### 使用模型进行翻译
 
+模型支持三种推理模式：单句翻译、交互式翻译和批量文件翻译。
+
+**当前支持的语言对：** 英语 → 法语
+
+**1. 单句翻译**
 ```bash
 python main.py --mode inference --input "This is a test sentence." --decode beam
 ```
 
-选项：
+**2. 交互式翻译模式**
+```bash
+python main.py --mode inference
+```
+
+在交互式模式中，您可以：
+- 输入任意英语文本将其翻译为法语
+- 输入`switch`在束搜索和贪婪搜索解码方法之间切换
+- 输入`q`、`exit`或`quit`退出程序
+- 输入`help`或`?`查看帮助信息
+
+**3. 批量文件翻译**
+```bash
+python main.py --mode inference --file input.txt --output translated.txt --decode beam
+```
+
+翻译选项：
 - `--decode beam`：使用束搜索解码（默认）
 - `--decode greedy`：使用贪婪搜索解码
 - `--ckpt_name 名称`：使用特定检查点（默认为best_ckpt.tar）
+- `--file 路径`：指定输入文件路径，用于批量翻译
+- `--output 路径`：指定输出文件路径（可选）
 
 ### 系统需求
 
@@ -215,8 +265,9 @@ python main.py --mode inference --input "This is a test sentence." --decode beam
 
 ## 自定义和扩展
 
-要调整模型超参数或优化选项，请编辑 `config.py` 文件中的 `MODEL_CONFIG` 字典。
-
+- 要调整模型超参数或优化选项，请编辑 `config.py` 文件中的 `MODEL_CONFIG` 字典
+- 要扩展到其他语言对，需要准备新的平行语料库并重新训练SentencePiece模型
+- 要实现双向翻译，请参考issue或相关讨论获取详细指南
 
 ## 致谢
 

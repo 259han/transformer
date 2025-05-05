@@ -1,0 +1,8 @@
+2025-05-05 21:36:41 | CRITICAL | translator | 程序执行过程中发生未处理的异常: local variable 'torch' referenced before assignment
+2025-05-05 21:36:41 | CRITICAL | translator | Traceback (most recent call last):
+  File "F:\program\transformer-translator-pytorch\main.py", line 606, in main
+    inference_manager.model = optimize_model(inference_manager.model)
+  File "F:\program\transformer-translator-pytorch\main.py", line 97, in optimize_model
+    if torch.cuda.is_available():
+UnboundLocalError: local variable 'torch' referenced before assignment
+

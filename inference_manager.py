@@ -9,6 +9,15 @@ import datetime
 from data_structure import BeamNode, PriorityQueue
 from logger import logger
 
+# 添加安全全局变量以允许numpy相关类型
+from numpy._core.multiarray import scalar
+from numpy import dtype
+torch.serialization.add_safe_globals([scalar, dtype])
+
+# 添加更多安全类型
+# 对于无法直接导入的类型，使用字符串形式添加
+torch.serialization.add_safe_globals(["numpy.dtypes.Float64DType"])
+
 class InferenceManager:
     def __init__(self, ckpt_name=None):
         # 词表加载
@@ -16,49 +25,165 @@ class InferenceManager:
         self.trg_i2w = {}
         self.src_w2i = {}
         self.trg_w2i = {}
+        
+        # 加载源语言和目标语言词表
+        self._load_vocabulary()
+        
+        # 初始化SentencePiece处理器（延迟加载）
+        self.src_sp = None
+        self.trg_sp = None
+        
+        # 加载模型
+        self.model = Transformer(src_vocab_size=len(self.src_i2w), trg_vocab_size=len(self.trg_i2w)).to(device)
+        if ckpt_name is not None:
+            checkpoint = torch.load(f"{ckpt_dir}/{ckpt_name}", map_location='cpu', weights_only=False)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.model.eval()
+    
+    def _load_vocabulary(self):
+        """加载词汇表"""
         with open(f"{SP_DIR}/{src_model_prefix}.vocab", 'r', encoding='utf-8') as f:
             lines = f.readlines()
         for i, line in enumerate(lines):
             word = line.strip().split('\t')[0]
             self.src_i2w[i] = word
             self.src_w2i[word] = i
+            
         with open(f"{SP_DIR}/{trg_model_prefix}.vocab", 'r', encoding='utf-8') as f:
             lines = f.readlines()
         for i, line in enumerate(lines):
             word = line.strip().split('\t')[0]
             self.trg_i2w[i] = word
             self.trg_w2i[word] = i
-        self.model = Transformer(src_vocab_size=len(self.src_i2w), trg_vocab_size=len(self.trg_i2w)).to(device)
-        if ckpt_name is not None:
-            checkpoint = torch.load(f"{ckpt_dir}/{ckpt_name}", map_location='cpu')
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.model.eval()
+    
+    def _ensure_tokenizers_loaded(self):
+        """确保分词器已加载"""
+        if self.src_sp is None:
+            self.src_sp = spm.SentencePieceProcessor()
+            self.src_sp.Load(f"{SP_DIR}/{src_model_prefix}.model")
+        
+        if self.trg_sp is None:
+            self.trg_sp = spm.SentencePieceProcessor()
+            self.trg_sp.Load(f"{SP_DIR}/{trg_model_prefix}.model")
+            # 验证SentencePiece解码器
+            self._test_sentencepiece(self.trg_sp)
 
-    def inference(self, input_sentence, method):
-        src_sp = spm.SentencePieceProcessor()
-        trg_sp = spm.SentencePieceProcessor()
-        src_sp.Load(f"{SP_DIR}/{src_model_prefix}.model")
-        trg_sp.Load(f"{SP_DIR}/{trg_model_prefix}.model")
+    def inference(self, input_sentence, method=None):
+        """
+        执行推理翻译
         
-        # 验证SentencePiece解码器
-        self._test_sentencepiece(trg_sp)
+        参数:
+        - input_sentence: 要翻译的输入文本
+        - method: 解码方法，'greedy'或'beam'，默认使用config中的decode_method设置
         
+        返回:
+        - 翻译后的文本
+        """
+        # 确保只处理一个句子的情况
+        if isinstance(input_sentence, list):
+            if len(input_sentence) == 1:
+                input_sentence = input_sentence[0]
+            else:
+                return self.batch_inference(input_sentence, method)
+                
+        # 使用配置中的默认解码方法（如果未指定）
+        if method is None:
+            method = TRAIN_CONFIG.get('decode_method', 'beam')
+        
+        # 确保分词器已加载
+        self._ensure_tokenizers_loaded()
+            
         input_sentence = input_sentence.strip()
-        tokenized = src_sp.EncodeAsIds(input_sentence)
-        print(f"输入分词后的token IDs: {tokenized}")
+        tokenized = self.src_sp.EncodeAsIds(input_sentence)
+        logger.debug(f"输入分词后的token IDs: {tokenized}")
         src_data = torch.LongTensor(pad_or_truncate(tokenized + [eos_id])).unsqueeze(0).to(device)
-        print(f"输入张量形状: {src_data.shape}")
+        logger.debug(f"输入张量形状: {src_data.shape}")
         e_mask = (src_data != pad_id).unsqueeze(1).to(device)
         with torch.no_grad():
             src_data = self.model.src_embedding(src_data)
             src_data = self.model.positional_encoder(src_data)
             e_output = self.model.encoder(src_data, e_mask)
             if method == 'greedy':
-                result = self.greedy_search(e_output, e_mask, trg_sp)
+                result = self.greedy_search(e_output, e_mask, self.trg_sp)
             elif method == 'beam':
-                result = self.beam_search(e_output, e_mask, trg_sp)
-        print(f"原始推理结果: '{result}'")
+                result = self.beam_search(e_output, e_mask, self.trg_sp)
+            else:
+                logger.warning(f"未知的解码方法: {method}，使用默认的beam搜索")
+                result = self.beam_search(e_output, e_mask, self.trg_sp)
+        logger.debug(f"翻译结果: {result}")
         return result
+    
+    def batch_inference(self, sentences, method=None):
+        """
+        批量执行推理翻译
+        
+        参数:
+        - sentences: 要翻译的输入文本列表
+        - method: 解码方法，'greedy'或'beam'，默认使用config中的decode_method设置
+        
+        返回:
+        - 翻译结果列表
+        """
+        if not sentences:
+            return []
+            
+        # 使用配置中的默认解码方法（如果未指定）
+        if method is None:
+            method = TRAIN_CONFIG.get('decode_method', 'beam')
+        
+        # 确保分词器已加载
+        self._ensure_tokenizers_loaded()
+        
+        # 对于beam search，当前只能逐个处理
+        if method == 'beam':
+            logger.info("束搜索模式下使用逐个句子翻译")
+            results = []
+            for sentence in sentences:
+                results.append(self.inference(sentence, method))
+            return results
+        
+        # 对于贪婪搜索，可以批量处理
+        logger.info(f"贪婪搜索模式下进行批量翻译，句子数: {len(sentences)}")
+        
+        # 将句子标记化并填充到相同长度
+        batch_tokens = []
+        max_len = 0
+        
+        # 首先确定最大长度
+        for sentence in sentences:
+            sentence = sentence.strip()
+            tokens = self.src_sp.EncodeAsIds(sentence) + [eos_id]
+            batch_tokens.append(tokens)
+            max_len = max(max_len, len(tokens))
+        
+        # 添加填充
+        padded_batch = []
+        for tokens in batch_tokens:
+            padded = tokens + [pad_id] * (max_len - len(tokens))
+            padded_batch.append(padded)
+        
+        # 将批处理转换为张量
+        src_data = torch.LongTensor(padded_batch).to(device)
+        e_mask = (src_data != pad_id).unsqueeze(1).to(device)
+        
+        # 编码批处理
+        with torch.no_grad():
+            embedded = self.model.src_embedding(src_data)
+            embedded = self.model.positional_encoder(embedded)
+            e_output = self.model.encoder(embedded, e_mask)
+        
+        # 对批处理中的每个样本执行贪婪搜索
+        results = []
+        for i in range(len(sentences)):
+            # 提取当前样本的编码器输出和掩码
+            single_e_output = e_output[i:i+1]
+            single_e_mask = e_mask[i:i+1]
+            
+            # 执行贪婪搜索
+            result = self.greedy_search(single_e_output, single_e_mask, self.trg_sp)
+            results.append(result)
+        
+        return results
 
     def greedy_search(self, e_output, e_mask, trg_sp):
         """贪婪搜索解码"""
@@ -69,15 +194,14 @@ class InferenceManager:
         # 获取输入序列长度
         batch_size, _, src_len = e_mask.size()
         
-        # 最大生成token数为源序列长度的一半或80，取较大值，避免生成结果被截断
+        # 最大生成token数为源序列长度的一半或80，取较大值
         max_token_to_generate = max(src_len // 2, 80)
-        logger.info(f"设置最大生成token数为: {max_token_to_generate}")
+        logger.debug(f"最大生成token数: {max_token_to_generate}")
         
         consecutive_pad_limit = 3  # 连续PAD标记的上限
-        
         consecutive_pad_count = 0
         
-        print("开始贪婪搜索...")
+        logger.debug("开始贪婪搜索")
         
         for step in range(max_token_to_generate):
             # 将当前序列转换为张量并填充
@@ -117,26 +241,19 @@ class InferenceManager:
                 prob[sos_id] = float('-inf')
                 prob[unk_id] = float('-inf')
             
-            # 获取Top-5概率的token用于调试
-            top_probs, top_indices = torch.topk(prob, 5)
-            top_probs = top_probs.exp().tolist()  # 转换回概率值
-            top_indices = top_indices.tolist()
-            
-            print(f"步骤 {step}, 位置 {cur_len-1}: Top-5 tokens: {list(zip(top_indices, top_probs))}")
-            
             # 获取概率最高的token
-            next_token = top_indices[0]
+            next_token = prob.argmax().item()
             
             # 如果是EOS标记，停止生成
             if next_token == eos_id:
-                print(f"生成了EOS标记，停止生成")
+                logger.debug("生成了EOS标记，停止生成")
                 break
             
             # 如果是PAD标记，计数并可能停止
             if next_token == pad_id:
                 consecutive_pad_count += 1
                 if consecutive_pad_count >= consecutive_pad_limit:
-                    print(f"连续生成了{consecutive_pad_count}个PAD标记，停止生成")
+                    logger.debug(f"连续生成了{consecutive_pad_count}个PAD标记，停止生成")
                     break
             else:
                 consecutive_pad_count = 0
@@ -151,7 +268,7 @@ class InferenceManager:
         if result and result[-1] == eos_id:
             result = result[:-1]
             
-        print(f"贪婪搜索完成，生成了{len(result)}个非填充token: {result}")
+        logger.debug(f"贪婪搜索完成，生成了{len(result)}个token")
         
         # 解码结果
         if not result:
@@ -159,10 +276,9 @@ class InferenceManager:
             
         try:
             translated_text = trg_sp.decode_ids(result)
-            print(f"最终翻译: '{translated_text}'")
             return translated_text
         except Exception as e:
-            print(f"解码出错: {str(e)}")
+            logger.error(f"解码出错: {str(e)}")
             return f"解码错误: {str(e)}"
 
     def beam_search(self, e_output, e_mask, trg_sp):
@@ -177,6 +293,8 @@ class InferenceManager:
         min_length = 5  # 最小翻译长度
         max_length = seq_len - 2  # 最大长度，保留结束标记位置
         
+        logger.debug("开始束搜索解码")
+        
         # 逐位置生成序列
         for pos in range(max_length):
             # 创建新队列
@@ -186,7 +304,7 @@ class InferenceManager:
             if queue_size == 0:
                 break
                 
-            print(f"束搜索位置 {pos}, 队列大小: {queue_size}")
+            logger.debug(f"束搜索位置 {pos}, 队列大小: {queue_size}")
             
             # 处理当前队列中的每个节点
             for k in range(queue_size):
@@ -248,7 +366,7 @@ class InferenceManager:
                     if token_id_val == eos_id and len(new_decoded) > min_length:
                         new_node.is_finished = True
                         finished_count += 1
-                        print(f"束搜索在位置{pos}找到一个完成的序列，分数: {new_log_prob:.4f}")
+                        logger.debug(f"发现完成序列，分数: {new_log_prob:.4f}")
                     
                     # 添加到新队列
                     new_queue.put(new_node)
@@ -258,7 +376,7 @@ class InferenceManager:
             
             # 足够的序列已完成时可以提前结束
             if finished_count >= beam_size:
-                print(f"束搜索提前完成，已有{finished_count}个束生成了结束标记")
+                logger.debug(f"束搜索提前完成，已有{finished_count}个束生成了结束标记")
                 break
         
         # 处理结果：从队列中获取所有节点
@@ -272,22 +390,18 @@ class InferenceManager:
         # 但为了保证一致性，我们还是显式排序一下
         candidates = sorted(candidates, key=lambda x: x[0], reverse=True)
         
-        # 输出所有候选结果信息
-        for i, (score, sequence, is_finished) in enumerate(candidates[:beam_size]):
-            status = "完成" if is_finished else "未完成"
-            seq_str = ' '.join([str(t) for t in sequence[:min(20, len(sequence))]])
-            print(f"候选 #{i+1}: 分数={score:.4f}, 长度={len(sequence)}, 状态={status}, 序列=[{seq_str}]")
+        logger.debug(f"束搜索完成，找到{len(candidates)}个候选序列")
         
         # 优先选择已完成的最高分候选
         for score, sequence, is_finished in candidates:
             if is_finished:
-                print(f"选择已完成的候选，分数: {score:.4f}")
+                logger.debug(f"选择完成候选，分数: {score:.4f}")
                 result_seq = sequence
                 break
         else:
             # 如果没有已完成的候选，选择分数最高的
             result_seq = candidates[0][1]
-            print(f"未找到已完成候选，选择最高分候选，分数: {candidates[0][0]:.4f}")
+            logger.debug(f"未找到完成候选，选择最高分候选，分数: {candidates[0][0]:.4f}")
         
         # 移除开始标记和结束标记（如果有）
         if result_seq[0] == sos_id:
@@ -299,9 +413,6 @@ class InferenceManager:
         # 过滤特殊标记
         filtered_seq = [t for t in result_seq if t not in [pad_id, sos_id, eos_id]]
         
-        print(f"过滤前序列: {result_seq}")
-        print(f"过滤后序列: {filtered_seq}")
-        
         # 如果过滤后为空，返回错误消息
         if not filtered_seq:
             return "生成失败：没有有效的翻译结果"
@@ -309,10 +420,9 @@ class InferenceManager:
         # 解码为文本
         try:
             translated_text = trg_sp.decode_ids(filtered_seq)
-            print(f"最终翻译: '{translated_text}'")
             return translated_text
         except Exception as e:
-            print(f"解码出错: {str(e)}")
+            logger.error(f"解码出错: {str(e)}")
             return f"解码错误: {str(e)}"
 
     def make_mask(self, src_input, trg_input):
@@ -325,55 +435,26 @@ class InferenceManager:
 
     def _test_sentencepiece(self, sp):
         """测试SentencePiece解码器是否正常工作"""
-        print("\n===== SentencePiece解码器验证 =====")
-        
-        # 1. 检查特殊token
-        print("1. 特殊token检查:")
-        special_tokens = {
-            "PAD": pad_id,
-            "SOS": sos_id,
-            "EOS": eos_id,
-            "UNK": unk_id
-        }
-        for name, token_id in special_tokens.items():
-            try:
-                token_text = sp.id_to_piece(token_id)
-                print(f"  {name}: ID={token_id}, 文本='{token_text}'")
-            except Exception as e:
-                print(f"  {name}: ID={token_id}, 错误: {str(e)}")
-                
-        # 2. 词表大小验证
-        print("\n2. 词表信息:")
-        vocab_size = sp.get_piece_size()
-        print(f"  词表大小: {vocab_size}")
-        
-        # 3. 基本解码测试 - 常用token
-        print("\n3. 常用token解码测试:")
-        common_ids = list(range(4, 20))  # 取词表前几个常用token
+        # 验证基本功能是否工作
         try:
-            common_text = sp.decode_ids(common_ids)
-            print(f"  常用token解码: {common_ids} -> '{common_text}'")
-        except Exception as e:
-            print(f"  常用token解码失败: {str(e)}")
-            
-        # 4. 单个token测试
-        print("\n4. 单个token测试:")
-        for token_id in range(4, min(14, vocab_size)):
-            try:
+            # 验证特殊token
+            for name, token_id in {"PAD": pad_id, "SOS": sos_id, "EOS": eos_id, "UNK": unk_id}.items():
                 token_text = sp.id_to_piece(token_id)
-                print(f"  Token {token_id}: '{token_text}'")
-            except Exception as e:
-                print(f"  Token {token_id} 解码失败: {str(e)}")
-                
-        # 5. 编码-解码一致性测试
-        print("\n5. 编码-解码一致性测试:")
-        test_texts = ["le", "la", "un", "une", "et", "de"]
-        for text in test_texts:
-            try:
-                encoded = sp.encode_as_ids(text)
-                decoded = sp.decode_ids(encoded)
-                print(f"  '{text}' -> {encoded} -> '{decoded}'")
-            except Exception as e:
-                print(f"  '{text}' 测试失败: {str(e)}")
-        
-        print("\n===== SentencePiece验证完成 =====\n") 
+            
+            # 验证基本解码功能
+            vocab_size = sp.get_piece_size()
+            
+            # 简单解码测试
+            test_ids = list(range(4, 8))
+            test_text = sp.decode_ids(test_ids)
+            
+            # 编码-解码一致性测试
+            test_word = "test"
+            encoded = sp.encode_as_ids(test_word)
+            decoded = sp.decode_ids(encoded)
+            
+            # 如果所有功能正常工作，返回
+            return
+        except Exception as e:
+            logger.error(f"SentencePiece验证失败: {str(e)}")
+            return 
